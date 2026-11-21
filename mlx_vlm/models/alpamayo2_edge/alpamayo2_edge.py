@@ -1,6 +1,7 @@
 """Full-precision MLX implementation of NVIDIA Alpamayo 2 Edge (VLM + Action Expert)."""
 
 import re
+from collections import OrderedDict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import mlx.core as mx
@@ -136,6 +137,59 @@ class Model(Cosmos3EdgeModel):
         )
         self._traj_logit_mask: Optional[mx.array] = None
         self.language_model._logit_mask = self._get_discrete_traj_mask()[0]
+        self._vision_feature_cache: OrderedDict[Any, mx.array] = OrderedDict()
+        self._vision_cache_max_items: int = 64
+
+    def clear_vision_cache(self) -> None:
+        self._vision_feature_cache.clear()
+
+    def _encode_vision_with_cache(
+        self,
+        pixel_values: mx.array,
+        image_grid_thw: mx.array,
+        cache_keys: Sequence[Any],
+    ) -> mx.array:
+        grids = image_grid_thw.tolist()
+        per_frame_features: List[Optional[mx.array]] = [None] * len(grids)
+        miss_indices: List[int] = []
+        miss_pixels: List[mx.array] = []
+        miss_grids: List[List[int]] = []
+
+        patch_offset = 0
+        for idx, (key, grid) in enumerate(zip(cache_keys, grids)):
+            t_g, h_g, w_g = int(grid[0]), int(grid[1]), int(grid[2])
+            n_patches = t_g * h_g * w_g
+            if key in self._vision_feature_cache:
+                self._vision_feature_cache.move_to_end(key)
+                per_frame_features[idx] = self._vision_feature_cache[key]
+            else:
+                miss_indices.append(idx)
+                miss_pixels.append(pixel_values[patch_offset : patch_offset + n_patches])
+                miss_grids.append([t_g, h_g, w_g])
+            patch_offset += n_patches
+
+        if miss_indices:
+            packed_miss = mx.concatenate(miss_pixels, axis=0)
+            miss_thw = mx.array(miss_grids, dtype=mx.int64)
+            encoded_miss = self.encode_vision(packed_miss, miss_thw)
+            tok_offset = 0
+            merge_sq = self.config.vision_config.spatial_merge_size ** 2
+            for idx, (t_g, h_g, w_g) in zip(miss_indices, miss_grids):
+                n_toks = (t_g * h_g * w_g) // merge_sq
+                feat = encoded_miss[tok_offset : tok_offset + n_toks]
+                mx.eval(feat)
+                tok_offset += n_toks
+                key = cache_keys[idx]
+                self._vision_feature_cache[key] = feat
+                if len(self._vision_feature_cache) > self._vision_cache_max_items:
+                    self._vision_feature_cache.popitem(last=False)
+                per_frame_features[idx] = feat
+            del packed_miss, encoded_miss
+            mx.clear_cache()
+
+        out = mx.concatenate([f for f in per_frame_features if f is not None], axis=0)
+        mx.eval(out)
+        return out
 
     def _get_discrete_traj_mask(self, dtype=mx.float32) -> mx.array:
         if self._traj_logit_mask is None:
@@ -362,6 +416,7 @@ class Model(Cosmos3EdgeModel):
         sample: Mapping[str, Any],
         processor: Any,
         nav_text: Optional[str] = None,
+        use_vision_cache: bool = False,
     ) -> Dict[str, Any]:
         """Prepare raw multi-camera frames + ego history + nav text for `sample_trajectories`."""
         raw_frames = np.asarray(sample["image_frames"])
@@ -458,8 +513,15 @@ class Model(Cosmos3EdgeModel):
         if ego_rot.ndim == 4:
             ego_rot = ego_rot[None, ...]
 
+        tok_dict = dict(proc_out)
+        if use_vision_cache or sample.get("use_vision_cache", False):
+            tok_dict["image_cache_keys"] = [
+                (int(c), int(ts), tuple(pb))
+                for c, ts, pb in zip(cam_ids.tolist(), timestamps.tolist(), pixel_bounds)
+            ]
+
         return {
-            "tokenized_data": dict(proc_out),
+            "tokenized_data": tok_dict,
             "ego_history_xyz": ego_xyz,
             "ego_history_rot": ego_rot,
             "prompt_text": prompt_text,
@@ -694,12 +756,18 @@ class Model(Cosmos3EdgeModel):
         expert_batch = batch_size * n_samples_total
         n_diff = self.expert.action_dims[0]
 
-        # 1. Micro-batched vision encode + multimodal embedding assembly
+        # 1. Micro-batched vision encode (with optional rolling frame cache) + multimodal embedding assembly
+        cached_vis = tokenized.get("cached_image_features")
+        cache_keys = tokenized.get("image_cache_keys")
+        if cached_vis is None and cache_keys is not None and pixel_values is not None and image_grid_thw is not None:
+            cached_vis = self._encode_vision_with_cache(pixel_values, image_grid_thw, cache_keys)
+
         emb_features = self.get_input_embeddings(
             input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             mask=prompt_mask,
+            cached_image_features=cached_vis,
         )
         full_embeds = emb_features.inputs_embeds
         full_pos_ids = emb_features.position_ids
