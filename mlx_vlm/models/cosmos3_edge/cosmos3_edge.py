@@ -63,7 +63,7 @@ class Model(nn.Module):
         """Encode packed vision patches in small frame micro-batches to bound Metal peak RAM & command buffer time."""
         if self.vision_tower is None or self.projector is None:
             raise ValueError("Cosmos3-Edge model was loaded without vision_tower/projector")
-        dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
+        dtype = self.vision_tower.post_layernorm.weight.dtype
         grids = grid_thw.tolist()
         n_items = len(grids)
 

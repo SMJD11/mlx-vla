@@ -8,8 +8,15 @@ from ..base import ensure_fused_sdpa
 from .config import ModelConfig, VisionConfig
 
 
+_BILINEAR_WEIGHT_CACHE: dict[Tuple[int, int], mx.array] = {}
+
+
 def _bilinear_antialias_weights(src: int, dst: int) -> mx.array:
     """Exact separable weights matching PyTorch F.interpolate(mode='bilinear', align_corners=False, antialias=True)."""
+    key = (src, dst)
+    cached = _BILINEAR_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
     scale = src / dst
     fscale = max(1.0, scale)
     centers = (np.arange(dst, dtype=np.float64) + 0.5) * scale
@@ -17,7 +24,9 @@ def _bilinear_antialias_weights(src: int, dst: int) -> mx.array:
     x = np.abs(j[None, :] - centers[:, None]) / fscale
     w = np.maximum(0.0, 1.0 - x)
     w /= w.sum(axis=1, keepdims=True)
-    return mx.array(w.astype(np.float32))
+    arr = mx.array(w.astype(np.float32))
+    _BILINEAR_WEIGHT_CACHE[key] = arr
+    return arr
 
 
 class Cosmos3EdgeVisionEmbeddings(nn.Module):
@@ -85,7 +94,11 @@ class Cosmos3EdgeVisionEmbeddings(nn.Module):
         return mx.concatenate(chunks, axis=0)
 
     def __call__(self, pixel_values: mx.array, grid_thw: mx.array) -> mx.array:
-        target_dtype = self.patch_embedding.weight.dtype
+        target_dtype = (
+            self.patch_embedding.bias.dtype
+            if getattr(self.patch_embedding, "bias", None) is not None
+            else self.position_embedding.weight.dtype
+        )
         patch_embeds = self.patch_embedding(pixel_values.astype(target_dtype))
         pos_embeds = self.resize_positional_embeddings(grid_thw)
         if patch_embeds.shape[0] != pos_embeds.shape[0]:

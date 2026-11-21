@@ -255,12 +255,13 @@ class Model(Cosmos3EdgeModel):
         full_pos_ids: mx.array,
         prompt_mask: mx.array,
         cache: List[KVCache],
-        prefill_step_size: int = 256,
+        prefill_step_size: int = 512,
         reserve_extra_tokens: int = 0,
+        include_last: bool = False,
     ) -> None:
-        """Prefill `input_ids[:, :-1]` in bounded token chunks so Metal command buffers stay tiny."""
+        """Prefill prompt tokens through the decoder trunk (skipping unused `lm_head`)."""
         prompt_length = input_ids.shape[1]
-        prefill_len = prompt_length - 1
+        prefill_len = prompt_length if include_last else (prompt_length - 1)
         if prefill_len <= 0:
             return
 
@@ -271,14 +272,22 @@ class Model(Cosmos3EdgeModel):
         has_padding = int((prompt_mask[:, :prefill_len] == 0).sum().item()) > 0
         for start in range(0, prefill_len, prefill_step_size):
             end = min(start + prefill_step_size, prefill_len)
-            chunk_mask = prompt_mask[:, :end] if has_padding else None
-            _ = self.language_model(
-                input_ids[:, start:end],
+            chunk_mask = (
+                self.language_model._build_mask(
+                    end - start,
+                    prompt_mask[:, :end],
+                    cache[0] if cache else None,
+                )
+                if has_padding
+                else None
+            )
+            _ = self.language_model.model(
+                inputs=None,
                 inputs_embeds=full_embeds[:, start:end, :],
                 mask=chunk_mask,
                 cache=cache,
                 position_ids=full_pos_ids[:, :, start:end],
-                logits_to_keep=1,
+                is_causal=True,
             )
             mx.eval([c.state for c in cache])
         mx.clear_cache()
@@ -655,22 +664,25 @@ class Model(Cosmos3EdgeModel):
             diff_pos[None, :, :], (3, cur_batch, n_diff)
         )
 
-        attn_mask_np = np.zeros(
-            (cur_batch, 1, n_diff, prefix_length + n_diff), dtype=np.float32
-        )
-        cache_cols = np.arange(prefix_length)[None, :]
-        invalid_cols = cache_cols >= offsets_np[:, None]
-        attn_mask_np[..., :prefix_length] = np.where(
-            invalid_cols[:, None, None, :], -1e9, 0.0
-        )
-        if has_padding:
-            pm_np = np.array(prompt_mask)
-            attn_mask_np[..., :prompt_length] = np.where(
-                pm_np[:, None, None, :] == 0,
-                -1e9,
-                attn_mask_np[..., :prompt_length],
+        if not has_padding and cur_batch == 1 and int(offsets_np[0]) == prefix_length:
+            expert_attn_mask = None
+        else:
+            attn_mask_np = np.zeros(
+                (cur_batch, 1, n_diff, prefix_length + n_diff), dtype=np.float32
             )
-        expert_attn_mask = mx.array(attn_mask_np)
+            cache_cols = np.arange(prefix_length)[None, :]
+            invalid_cols = cache_cols >= offsets_np[:, None]
+            attn_mask_np[..., :prefix_length] = np.where(
+                invalid_cols[:, None, None, :], -1e9, 0.0
+            )
+            if has_padding:
+                pm_np = np.array(prompt_mask)
+                attn_mask_np[..., :prompt_length] = np.where(
+                    pm_np[:, None, None, :] == 0,
+                    -1e9,
+                    attn_mask_np[..., :prompt_length],
+                )
+            expert_attn_mask = mx.array(attn_mask_np)
 
         sampled_action_mx = self.expert.sample_actions(
             cache=cache,
@@ -699,19 +711,25 @@ class Model(Cosmos3EdgeModel):
         diffusion_temperature: float = 1.0,
         initial_noise: Optional[mx.array] = None,
         seed: Optional[int] = None,
-        prefill_step_size: int = 256,
+        prefill_step_size: int = 512,
         low_memory: bool = True,
+        reasoning_mode: str = "adaptive",
         return_extra: bool = True,
     ) -> tuple:
-        """Run VLM chunked prefill -> CoT generation -> 10-step Euler flow matching -> trajectory decode.
+        """Run VLM chunked prefill -> CoT generation -> Euler flow matching -> trajectory decode.
 
-        When `low_memory=True` (default) and `batch_size == 1`, multiple trajectory candidates
-        (`num_traj_sets * num_traj_samples > 1`) reuse the single shared prefill KV cache in-place
-        by trimming back to `prompt_length - 1` after each candidate instead of duplicating multi-hundred-MB
-        KV caches across batch rows.
+        Args:
+            reasoning_mode:
+                - ``"adaptive"`` (default): Normal adaptive CoT generation up to `<|traj_future_start|>`.
+                - ``"nominal"``: Zero-thought fast path — appends `<NOMINAL><|traj_future_start|>`
+                  directly onto the prompt so decode takes 0 tokens / 0 ms with deterministic latency.
+                - ``"none"``: Zero-thought fast path — appends `<|traj_future_start|>` directly.
+            low_memory: When True and `batch_size == 1`, multiple candidates reuse one shared KV cache.
         """
         if self.expert is None:
             raise ValueError("Model was initialized without an expert.")
+        if reasoning_mode not in ("adaptive", "nominal", "none"):
+            raise ValueError(f"Unsupported reasoning_mode={reasoning_mode!r}; expected 'adaptive', 'nominal', or 'none'")
 
         mx.set_cache_limit(256 * 1024 * 1024)
         if seed is not None:
@@ -738,9 +756,30 @@ class Model(Cosmos3EdgeModel):
         else:
             fused_ids_np = raw_ids
 
-        input_ids = mx.array(fused_ids_np, dtype=mx.int32)
+        anchor_id = int(self.config.traj_ids["future_start"])
+        zero_thought = reasoning_mode in ("nominal", "none")
+        suffix_ids: List[int] = []
+        if zero_thought:
+            if reasoning_mode == "nominal" and tokenizer is not None:
+                suffix_ids = list(tokenizer.encode("<NOMINAL>", add_special_tokens=False))
+            suffix_ids.append(anchor_id)
+            suf_arr = np.broadcast_to(
+                np.asarray(suffix_ids, dtype=np.int64)[None, :],
+                (fused_ids_np.shape[0], len(suffix_ids)),
+            )
+            prompt_ids_np = np.concatenate([fused_ids_np, suf_arr], axis=1)
+        else:
+            prompt_ids_np = fused_ids_np
+
+        input_ids = mx.array(prompt_ids_np, dtype=mx.int32)
         if "attention_mask" in tokenized and tokenized["attention_mask"] is not None:
-            prompt_mask = mx.array(np.asarray(tokenized["attention_mask"]), dtype=mx.int32)
+            mask_np = np.asarray(tokenized["attention_mask"], dtype=np.int32)
+            if suffix_ids:
+                mask_np = np.concatenate(
+                    [mask_np, np.ones((mask_np.shape[0], len(suffix_ids)), dtype=np.int32)],
+                    axis=1,
+                )
+            prompt_mask = mx.array(mask_np, dtype=mx.int32)
         else:
             prompt_mask = mx.ones_like(input_ids)
 
@@ -773,6 +812,83 @@ class Model(Cosmos3EdgeModel):
         full_pos_ids = emb_features.position_ids
         rope_deltas = emb_features.rope_deltas
 
+        # 2. Fast zero-thought path: prefill entire prompt + forced anchor directly into Expert (0 decode steps!)
+        if zero_thought:
+            cache = make_prompt_cache(self.language_model)
+            self._chunked_prefill(
+                input_ids,
+                full_embeds,
+                full_pos_ids,
+                prompt_mask,
+                cache,
+                prefill_step_size=prefill_step_size,
+                reserve_extra_tokens=n_diff + 4,
+                include_last=True,
+            )
+            del full_embeds
+            mx.clear_cache()
+
+            has_padding = int((prompt_mask == 0).sum().item()) > 0
+            pad_counts_base = mx.sum((prompt_mask == 0).astype(mx.int32), axis=-1, keepdims=True)
+            effective_rope_base = rope_deltas - pad_counts_base
+            prefix_length = cache[0].offset
+
+            diff_pos = mx.arange(n_diff, dtype=mx.int32)[None, :] + effective_rope_base + prefix_length
+            expert_pos_ids = mx.broadcast_to(diff_pos[None, :, :], (3, batch_size, n_diff))
+            if not has_padding:
+                expert_attn_mask = None
+            else:
+                attn_mask_np = np.zeros((batch_size, 1, n_diff, prefix_length + n_diff), dtype=np.float32)
+                pm_np = np.array(prompt_mask)
+                attn_mask_np[..., :prompt_length] = np.where(pm_np[:, None, None, :] == 0, -1e9, 0.0)
+                expert_attn_mask = mx.array(attn_mask_np)
+
+            actions_list = []
+            for s_idx in range(n_samples_total):
+                noise_s = initial_noise[s_idx : s_idx + 1] if initial_noise is not None else None
+                act_mx = self.expert.sample_actions(
+                    cache=cache,
+                    prefix_length=prefix_length,
+                    position_ids=expert_pos_ids,
+                    attention_mask=expert_attn_mask,
+                    batch_size=batch_size,
+                    inference_steps=diffusion_steps,
+                    temperature=diffusion_temperature,
+                    initial_noise=noise_s,
+                    seed=None,
+                )
+                actions_list.append(np.array(act_mx, dtype=np.float32))
+            sampled_action_np = np.concatenate(actions_list, axis=0)
+            gen_np = np.broadcast_to(
+                np.asarray(suffix_ids, dtype=np.int64)[None, :],
+                (expert_batch, len(suffix_ids)),
+            ).copy()
+            first_anchor_pos = np.full((expert_batch,), len(suffix_ids) - 1, dtype=np.int64)
+            del cache
+            mx.clear_cache()
+
+            hist_xyz_last = np.repeat(ego_xyz[:, -1], n_samples_total, axis=0)
+            hist_rot_last = np.repeat(ego_rot[:, -1], n_samples_total, axis=0)
+            pred_xyz, pred_rot = self.expert.action_space.action_to_traj(
+                sampled_action_np, hist_xyz_last, hist_rot_last
+            )
+            group_shape = (batch_size, num_traj_sets, num_traj_samples)
+            pred_xyz = pred_xyz.reshape(*group_shape, *pred_xyz.shape[1:])
+            pred_rot = pred_rot.reshape(*group_shape, *pred_rot.shape[1:])
+            logprob = np.zeros(pred_xyz.shape[:-1], dtype=np.float32)
+            if not return_extra:
+                return pred_xyz, pred_rot, logprob
+            extra: Dict[str, Any] = {
+                "sampled_action": sampled_action_np.reshape(*group_shape, *self.expert.action_dims),
+                "generated_ids": gen_np,
+            }
+            if tokenizer is not None:
+                cot_label = "<NOMINAL>" if reasoning_mode == "nominal" else ""
+                extra["cot"] = np.full(group_shape, cot_label, dtype=object)
+                extra["reasoning"] = np.full(group_shape, "", dtype=object)
+                extra["answer"] = np.full(group_shape, cot_label, dtype=object)
+            return pred_xyz, pred_rot, logprob, extra
+
         last_tokens_base = input_ids[:, -1:]
         last_embeds_base = full_embeds[:, -1:, :]
         last_pos_base = full_pos_ids[:, :, -1:]
@@ -795,7 +911,6 @@ class Model(Cosmos3EdgeModel):
         mx.clear_cache()
 
         # Build static logit mask blocking discrete trajectory codes & non-anchor EOS
-        anchor_id = int(self.config.traj_ids["future_start"])
         vocab_size = self.config.vocab_size
         logit_mask_np = np.zeros((1, vocab_size), dtype=np.float32)
         h0 = int(self.config.traj_ids["history_id0"])

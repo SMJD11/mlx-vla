@@ -433,32 +433,9 @@ class LanguageModel(nn.Module):
                     pos[None, :, :], (3, batch_size, seq_length)
                 )
 
-        # Ensure 2D attention mask is sliced to active KV length for chunked prefill
-        attn_mask = None
-        if mask is not None and mask.ndim == 4:
-            attn_mask = mask
-        elif mask is not None and mask.ndim == 2:
-            active_k_len = int(cache_offset) + seq_length
-            cur_mask = mask[:, :active_k_len]
-            if int((cur_mask == 0).sum().item()) > 0:
-                k_len = cur_mask.shape[-1]
-                q_len = seq_length
-                pad_mask = mx.where(
-                    cur_mask == 0,
-                    mx.array(-1e9, dtype=mx.float32),
-                    mx.array(0.0, dtype=mx.float32),
-                )[:, None, None, :]
-                if q_len > 1:
-                    idx_q = mx.arange(k_len - q_len, k_len)[:, None]
-                    idx_k = mx.arange(k_len)[None, :]
-                    causal = mx.where(
-                        idx_k > idx_q,
-                        mx.array(-1e9, dtype=mx.float32),
-                        mx.array(0.0, dtype=mx.float32),
-                    )
-                    attn_mask = pad_mask + causal[None, None, :, :]
-                else:
-                    attn_mask = pad_mask
+        attn_mask = self._build_mask(
+            seq_length, mask, cache[0] if cache and cache[0] is not None else None
+        )
 
         hidden = self.model(
             inputs,
@@ -476,6 +453,43 @@ class LanguageModel(nn.Module):
         if self._logit_mask is not None:
             logits = logits + self._logit_mask.astype(logits.dtype)
         return LanguageModelOutput(logits=logits)
+
+    def _build_mask(
+        self,
+        seq_length: int,
+        mask: Optional[mx.array],
+        cache_item=None,
+    ) -> Optional[mx.array]:
+        if mask is None:
+            return None
+        if mask.ndim == 4:
+            return mask
+        if mask.ndim == 2:
+            cache_offset = 0
+            if cache_item is not None:
+                off = cache_item.offset
+                cache_offset = int(off.max().item()) if isinstance(off, mx.array) else int(off)
+            active_k_len = cache_offset + seq_length
+            cur_mask = mask[:, :active_k_len]
+            if int((cur_mask == 0).sum().item()) > 0:
+                k_len = cur_mask.shape[-1]
+                q_len = seq_length
+                pad_mask = mx.where(
+                    cur_mask == 0,
+                    mx.array(-1e9, dtype=mx.float32),
+                    mx.array(0.0, dtype=mx.float32),
+                )[:, None, None, :]
+                if q_len > 1:
+                    idx_q = mx.arange(k_len - q_len, k_len)[:, None]
+                    idx_k = mx.arange(k_len)[None, :]
+                    causal = mx.where(
+                        idx_k > idx_q,
+                        mx.array(-1e9, dtype=mx.float32),
+                        mx.array(0.0, dtype=mx.float32),
+                    )
+                    return pad_mask + causal[None, None, :, :]
+                return pad_mask
+        return None
 
     @property
     def layers(self):

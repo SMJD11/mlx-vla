@@ -179,6 +179,19 @@ def test_alpamayo2_edge_end_to_end_tiny_trajectory_sampling():
     assert np.isfinite(xyz).all()
     assert np.isfinite(rot).all()
 
+    # Zero-thought fast path (`reasoning_mode="none"`)
+    xyz_z, rot_z, _, _ = model.sample_trajectories(
+        data,
+        temperature=0.0,
+        num_traj_sets=1,
+        num_traj_samples=1,
+        diffusion_steps=3,
+        reasoning_mode="none",
+        seed=0,
+    )
+    assert xyz_z.shape == (1, 1, 1, 8, 3)
+    assert np.isfinite(xyz_z).all() and np.isfinite(rot_z).all()
+
 
 if __name__ == "__main__":
     test_cosmos3_edge_image_processor_hwc_patch_layout()

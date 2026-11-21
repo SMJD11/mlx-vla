@@ -98,7 +98,7 @@ class PerWaypointActionInProjV2(nn.Module):
                 t_feats, (batch_size, n_waypoints, t_feats.shape[-1])
             )
         feats = mx.concatenate([action_feats, t_feats], axis=-1)
-        target_dtype = self.encoder.trunk[0].weight.dtype
+        target_dtype = self.norm.weight.dtype
         feats = feats.astype(target_dtype)
         encoded = self.encoder(feats.reshape(batch_size * n_waypoints, -1)).reshape(
             batch_size, n_waypoints, self.out_dim
@@ -137,7 +137,7 @@ class ExpertModel(nn.Module):
         cache: list,
         prefix_length: int,
         position_ids: mx.array,
-        attention_mask: mx.array,
+        attention_mask: Optional[mx.array],
         batch_size: int,
         inference_steps: Optional[int] = None,
         temperature: float = 1.0,
@@ -147,7 +147,7 @@ class ExpertModel(nn.Module):
         steps = inference_steps or self.default_inference_steps
         n_tokens, action_dim = self.action_dims
 
-        # Pre-reserve cache capacity so 10 denoising steps update & trim in-place with zero reallocations
+        # Pre-reserve cache capacity so denoising steps update & trim in-place with zero reallocations
         for c in cache:
             if c is not None and hasattr(c, "prefix_cache_reserve"):
                 c.prefix_cache_reserve(prefix_length + n_tokens)
@@ -163,7 +163,9 @@ class ExpertModel(nn.Module):
             )
 
         time_steps = np.linspace(0.0, 1.0, steps + 1, dtype=np.float32)
-        mask_cast = attention_mask.astype(self.expert.layers[0].self_attn.q_proj.weight.dtype)
+        # Use norm dtype (always floating-point even when linear layers are 4-bit/8-bit quantized)
+        compute_dtype = self.expert.norm.weight.dtype
+        mask_cast = attention_mask.astype(compute_dtype) if attention_mask is not None else None
 
         for i in range(steps):
             dt = float(time_steps[i + 1] - time_steps[i])
@@ -189,10 +191,8 @@ class ExpertModel(nn.Module):
 
             v = self.action_out_proj(hidden).astype(mx.float32)
             x = x + dt * v
-            mx.eval(
-                x,
-                *[c.keys for c in cache if c is not None and c.keys is not None],
-                *[c.values for c in cache if c is not None and c.values is not None],
-            )
+            if i + 1 < steps:
+                mx.async_eval(x)
 
+        mx.eval(x)
         return x
