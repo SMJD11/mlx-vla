@@ -288,7 +288,8 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
             "MB. This can be slow. See the documentation for possible work-arounds: "
             "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
         )
-    old_limit = mx.set_wired_limit(max_rec_size)
+    target_limit = min(max_rec_size, model_bytes + (512 << 20)) if model_bytes > 0 else max_rec_size
+    old_limit = mx.set_wired_limit(target_limit)
     try:
         yield
     finally:

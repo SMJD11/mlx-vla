@@ -167,8 +167,11 @@ def skip_multimodal_module(path: str) -> bool:
         "embed_audio",
         "code_predictor",
         "img_projector",
+        "projector",
         "multi_modal_projector",
         "patch_merge_mlp",
+        "action_in_proj",
+        "action_out_proj",
     )
     return any(module in path for module in multimodal_modules)
 
