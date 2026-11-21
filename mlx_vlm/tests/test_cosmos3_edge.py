@@ -192,6 +192,29 @@ def test_alpamayo2_edge_end_to_end_tiny_trajectory_sampling():
     assert xyz_z.shape == (1, 1, 1, 8, 3)
     assert np.isfinite(xyz_z).all() and np.isfinite(rot_z).all()
 
+    # Hybrid 16-bit prefill + 4-bit shadow CoT decode
+    model.language_model.lm_head = nn.Linear(64, 256, bias=False)
+    w = np.full((256, 64), -1.0, dtype=np.float32)
+    w[224, :] = 10.0
+    model.language_model.lm_head.weight = mx.array(w)
+    model.language_model.model.norm.weight = mx.ones((64,), dtype=mx.float32)
+    mx.eval(model.parameters())
+    model.enable_hybrid_q4_decode(bits=4, group_size=32)
+    assert model._decode_language_model is not None
+    xyz_h, rot_h, _, _ = model.sample_trajectories(
+        data,
+        temperature=0.0,
+        num_traj_sets=1,
+        num_traj_samples=1,
+        max_generation_length=4,
+        diffusion_steps=3,
+        seed=0,
+    )
+    assert xyz_h.shape == (1, 1, 1, 8, 3)
+    assert np.isfinite(xyz_h).all() and np.isfinite(rot_h).all()
+    model.disable_hybrid_q4_decode()
+    assert model._decode_language_model is None
+
 
 if __name__ == "__main__":
     test_cosmos3_edge_image_processor_hwc_patch_layout()

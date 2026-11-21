@@ -12,6 +12,7 @@ from ..base import LanguageModelOutput
 from ..cache import KVCache, make_prompt_cache
 from ..cosmos3_edge import processing_cosmos3_edge  # noqa: F401
 from ..cosmos3_edge.cosmos3_edge import Model as Cosmos3EdgeModel
+from ..cosmos3_edge.language import LanguageModel as Cosmos3EdgeLanguageModel
 from .action_space import DeltaTrajectoryTokenizer, fuse_history_traj_tokens
 from .config import ModelConfig
 from .expert import ExpertModel
@@ -139,6 +140,30 @@ class Model(Cosmos3EdgeModel):
         self.language_model._logit_mask = self._get_discrete_traj_mask()[0]
         self._vision_feature_cache: OrderedDict[Any, mx.array] = OrderedDict()
         self._vision_cache_max_items: int = 64
+        self._decode_language_model: Optional[Cosmos3EdgeLanguageModel] = None
+
+    def enable_hybrid_q4_decode(self, bits: int = 4, group_size: int = 64) -> None:
+        """Create a quantized shadow LLM for fast CoT token decoding while keeping 16-bit prefill."""
+        from mlx.utils import tree_map
+
+        shadow = Cosmos3EdgeLanguageModel(self.config.text_config, self.config)
+        shadow.update(tree_map(lambda x: x, self.language_model.parameters()))
+        shadow._logit_mask = self.language_model._logit_mask
+        nn.quantize(
+            shadow,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+            class_predicate=lambda p, m: hasattr(m, "to_quantized")
+            and hasattr(m, "weight")
+            and m.weight.shape[-1] % group_size == 0,
+        )
+        mx.eval(shadow.parameters())
+        self._decode_language_model = shadow
+
+    def disable_hybrid_q4_decode(self) -> None:
+        self._decode_language_model = None
+        mx.clear_cache()
 
     def clear_vision_cache(self) -> None:
         self._vision_feature_cache.clear()
@@ -561,6 +586,11 @@ class Model(Cosmos3EdgeModel):
         cur_tokens = last_tokens
         cur_embeds: Optional[mx.array] = last_embeds
         cur_pos = last_pos
+        decode_lm = (
+            self._decode_language_model
+            if self._decode_language_model is not None
+            else self.language_model
+        )
 
         generated_cols: List[np.ndarray] = []
         anchor_found = np.zeros((cur_batch,), dtype=bool)
@@ -580,7 +610,24 @@ class Model(Cosmos3EdgeModel):
                 else None
             )
 
-            out = self.language_model(
+            if anchor_found.all():
+                # Only cache the final anchor token K/V — skip unused lm_head!
+                attn_mask = decode_lm._build_mask(
+                    cur_tokens.shape[1], step_mask, cache[0] if cache else None
+                )
+                _ = decode_lm.model(
+                    cur_tokens,
+                    inputs_embeds=cur_embeds,
+                    mask=attn_mask,
+                    cache=cache,
+                    position_ids=cur_pos,
+                    is_causal=True,
+                )
+                anchor_cached = True
+                mx.eval([c.state for c in cache])
+                break
+
+            out = decode_lm(
                 cur_tokens,
                 inputs_embeds=cur_embeds,
                 mask=step_mask,
@@ -588,11 +635,6 @@ class Model(Cosmos3EdgeModel):
                 position_ids=cur_pos,
                 logits_to_keep=1,
             )
-
-            if anchor_found.all():
-                anchor_cached = True
-                mx.eval([c.state for c in cache])
-                break
 
             if step_idx >= max_generation_length:
                 break
@@ -640,7 +682,7 @@ class Model(Cosmos3EdgeModel):
                 if has_padding
                 else None
             )
-            _ = self.language_model(
+            _ = decode_lm(
                 cur_tokens,
                 mask=cur_out_mask,
                 cache=cache,
