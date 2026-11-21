@@ -135,7 +135,7 @@ class ExpertModel(nn.Module):
     def sample_actions(
         self,
         cache: list,
-        prefix_length: int,
+        prefix_length: int | list[int],
         position_ids: mx.array,
         attention_mask: Optional[mx.array],
         batch_size: int,
@@ -146,11 +146,16 @@ class ExpertModel(nn.Module):
     ) -> mx.array:
         steps = inference_steps or self.default_inference_steps
         n_tokens, action_dim = self.action_dims
+        layer_prefixes = (
+            [int(prefix_length)] * len(cache)
+            if isinstance(prefix_length, (int, np.integer))
+            else [int(p) for p in prefix_length]
+        )
 
         # Pre-reserve cache capacity so denoising steps update & trim in-place with zero reallocations
-        for c in cache:
+        for c, lp in zip(cache, layer_prefixes):
             if c is not None and hasattr(c, "prefix_cache_reserve"):
-                c.prefix_cache_reserve(prefix_length + n_tokens)
+                c.prefix_cache_reserve(lp + n_tokens)
 
         if initial_noise is not None:
             x = initial_noise.astype(mx.float32)
@@ -182,12 +187,12 @@ class ExpertModel(nn.Module):
                     is_causal=False,
                 )
             finally:
-                for c in cache:
+                for c, lp in zip(cache, layer_prefixes):
                     if c is not None:
                         if hasattr(c, "trim"):
-                            c.trim(c.offset - prefix_length)
+                            c.trim(c.offset - lp)
                         elif hasattr(c, "offset"):
-                            c.offset = prefix_length
+                            c.offset = lp
 
             v = self.action_out_proj(hidden).astype(mx.float32)
             x = x + dt * v

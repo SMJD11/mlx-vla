@@ -31,13 +31,16 @@ def masked_scatter(
     mask_expanded: mx.array,
     features: mx.array,
 ) -> mx.array:
-    orig_shape = final_embedding.shape
-    flat_emb = mx.flatten(final_embedding)
-    flat_feat = mx.flatten(features.astype(final_embedding.dtype))
-    flat_mask = mx.flatten(mask_expanded)
-    positions = mx.array(np.where(np.array(flat_mask))[0], dtype=mx.uint32)
-    flat_emb[positions] = flat_feat
-    return mx.reshape(flat_emb, orig_shape)
+    """Fast token-index visual feature scatter (avoids copying B*L*D booleans to CPU)."""
+    B, L, D = final_embedding.shape
+    mask_2d = mask_expanded[:, :, 0] if mask_expanded.ndim == 3 else mask_expanded
+    pos_np = np.where(np.array(mask_2d).reshape(-1))[0]
+    if pos_np.size == 0:
+        return final_embedding
+    positions = mx.array(pos_np, dtype=mx.uint32)
+    emb_2d = final_embedding.reshape(B * L, D)
+    emb_2d[positions] = features.astype(final_embedding.dtype).reshape(-1, D)
+    return emb_2d.reshape(B, L, D)
 
 
 class Model(nn.Module):
@@ -124,11 +127,7 @@ class Model(nn.Module):
             vis_mask = (input_ids == self.config.image_token_index) | (
                 input_ids == self.config.video_token_index
             )
-            inputs_embeds = masked_scatter(
-                inputs_embeds,
-                mx.broadcast_to(vis_mask[..., None], inputs_embeds.shape),
-                cached,
-            )
+            inputs_embeds = masked_scatter(inputs_embeds, vis_mask, cached)
         else:
             if pixel_values is not None:
                 img_features = self.encode_vision(pixel_values, image_grid_thw)
@@ -138,11 +137,7 @@ class Model(nn.Module):
                     raise ValueError(
                         f"Image features and image tokens do not match: tokens={n_img_tokens}, features={img_features.shape[0]}"
                     )
-                inputs_embeds = masked_scatter(
-                    inputs_embeds,
-                    mx.broadcast_to(img_mask[..., None], inputs_embeds.shape),
-                    img_features,
-                )
+                inputs_embeds = masked_scatter(inputs_embeds, img_mask, img_features)
 
             if pixel_values_videos is not None:
                 vid_features = self.encode_vision(pixel_values_videos, video_grid_thw)
@@ -152,11 +147,7 @@ class Model(nn.Module):
                     raise ValueError(
                         f"Video features and video tokens do not match: tokens={n_vid_tokens}, features={vid_features.shape[0]}"
                     )
-                inputs_embeds = masked_scatter(
-                    inputs_embeds,
-                    mx.broadcast_to(vid_mask[..., None], inputs_embeds.shape),
-                    vid_features,
-                )
+                inputs_embeds = masked_scatter(inputs_embeds, vid_mask, vid_features)
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, image_grid_thw, video_grid_thw, mask

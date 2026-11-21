@@ -131,6 +131,7 @@ def test_alpamayo2_edge_end_to_end_tiny_trajectory_sampling():
         ),
         history_vocab_size=10,
         future_vocab_size=10,
+        hist_traj_tokenizer_cfg={"num_bins": 10},
         tokens_per_history_traj=6,
         tokens_per_future_traj=16,
         traj_ids={
@@ -192,7 +193,11 @@ def test_alpamayo2_edge_end_to_end_tiny_trajectory_sampling():
     assert xyz_z.shape == (1, 1, 1, 8, 3)
     assert np.isfinite(xyz_z).all() and np.isfinite(rot_z).all()
 
-    # Hybrid 16-bit prefill + 4-bit shadow CoT decode
+    # Hybrid 16-bit prefill + 4-bit shadow CoT decode + Temporal-DFlash speculative CoT
+    model.language_model.model.embed_tokens.weight = mx.ones((256, 64), dtype=mx.float32)
+    for lyr in model.language_model.model.layers:
+        lyr.self_attn.o_proj.weight = mx.zeros_like(lyr.self_attn.o_proj.weight)
+        lyr.mlp.fc2.weight = mx.zeros_like(lyr.mlp.fc2.weight)
     model.language_model.lm_head = nn.Linear(64, 256, bias=False)
     w = np.full((256, 64), -1.0, dtype=np.float32)
     w[224, :] = 10.0
@@ -201,17 +206,39 @@ def test_alpamayo2_edge_end_to_end_tiny_trajectory_sampling():
     mx.eval(model.parameters())
     model.enable_hybrid_q4_decode(bits=4, group_size=32)
     assert model._decode_language_model is not None
-    xyz_h, rot_h, _, _ = model.sample_trajectories(
+    # Test Temporal-DFlash speculative CoT (2 consecutive calls: cold populate + 1-pass verify!) + FastV
+    model.clear_cot_history()
+    fixed_noise = mx.zeros((1, 8, 2), dtype=mx.float32)
+    xyz_h1, rot_h1, _, extra_h1 = model.sample_trajectories(
         data,
         temperature=0.0,
         num_traj_sets=1,
         num_traj_samples=1,
         max_generation_length=4,
         diffusion_steps=3,
-        seed=0,
+        speculative_cot=True,
+        fastv_layer=1,
+        fastv_keep_ratio=0.5,
+        initial_noise=fixed_noise,
     )
-    assert xyz_h.shape == (1, 1, 1, 8, 3)
-    assert np.isfinite(xyz_h).all() and np.isfinite(rot_h).all()
+    assert xyz_h1.shape == (1, 1, 1, 8, 3)
+    assert np.isfinite(xyz_h1).all() and np.isfinite(rot_h1).all()
+    assert len(model._cot_history) == 1
+    # Second call should speculatively verify the cached CoT in 1 pass with exact equivalence
+    xyz_h2, rot_h2, _, extra_h2 = model.sample_trajectories(
+        data,
+        temperature=0.0,
+        num_traj_sets=1,
+        num_traj_samples=1,
+        max_generation_length=4,
+        diffusion_steps=3,
+        speculative_cot=True,
+        fastv_layer=1,
+        fastv_keep_ratio=0.5,
+        initial_noise=fixed_noise,
+    )
+    assert np.allclose(xyz_h1, xyz_h2, atol=1e-4)
+    assert extra_h2["spec_stats"]["forward_passes"] == 1
     model.disable_hybrid_q4_decode()
     assert model._decode_language_model is None
 

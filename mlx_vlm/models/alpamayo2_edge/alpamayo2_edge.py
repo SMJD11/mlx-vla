@@ -141,6 +141,16 @@ class Model(Cosmos3EdgeModel):
         self._vision_feature_cache: OrderedDict[Any, mx.array] = OrderedDict()
         self._vision_cache_max_items: int = 64
         self._decode_language_model: Optional[Cosmos3EdgeLanguageModel] = None
+        self._external_vision_encoder = None
+        self._cot_history: List[List[int]] = []
+        self._cot_history_max_items: int = 8
+
+    def set_external_vision_encoder(self, fn) -> None:
+        """Register an external vision encoder `fn(pixel_values_mx, grid_thw_mx) -> mx.array` (e.g. CoreML ANE)."""
+        self._external_vision_encoder = fn
+
+    def clear_cot_history(self) -> None:
+        self._cot_history.clear()
 
     def enable_hybrid_q4_decode(self, bits: int = 4, group_size: int = 64) -> None:
         """Create a quantized shadow LLM for fast CoT token decoding while keeping 16-bit prefill."""
@@ -170,33 +180,46 @@ class Model(Cosmos3EdgeModel):
 
     def _encode_vision_with_cache(
         self,
-        pixel_values: mx.array,
+        pixel_values: Optional[mx.array],
         image_grid_thw: mx.array,
         cache_keys: Sequence[Any],
+        miss_only_packed: Optional[Sequence[int]] = None,
     ) -> mx.array:
         grids = image_grid_thw.tolist()
         per_frame_features: List[Optional[mx.array]] = [None] * len(grids)
         miss_indices: List[int] = []
         miss_pixels: List[mx.array] = []
         miss_grids: List[List[int]] = []
+        packed_miss_set = set(miss_only_packed) if miss_only_packed is not None else None
 
         patch_offset = 0
         for idx, (key, grid) in enumerate(zip(cache_keys, grids)):
             t_g, h_g, w_g = int(grid[0]), int(grid[1]), int(grid[2])
             n_patches = t_g * h_g * w_g
+            in_packed = packed_miss_set is None or idx in packed_miss_set
             if key in self._vision_feature_cache:
                 self._vision_feature_cache.move_to_end(key)
                 per_frame_features[idx] = self._vision_feature_cache[key]
             else:
+                if pixel_values is None or not in_packed:
+                    raise ValueError(f"Vision cache miss for key={key} without packed pixel_values")
                 miss_indices.append(idx)
                 miss_pixels.append(pixel_values[patch_offset : patch_offset + n_patches])
                 miss_grids.append([t_g, h_g, w_g])
-            patch_offset += n_patches
+            if in_packed:
+                patch_offset += n_patches
 
         if miss_indices:
-            packed_miss = mx.concatenate(miss_pixels, axis=0)
+            packed_miss = (
+                miss_pixels[0]
+                if len(miss_pixels) == 1
+                else mx.concatenate(miss_pixels, axis=0)
+            )
             miss_thw = mx.array(miss_grids, dtype=mx.int64)
-            encoded_miss = self.encode_vision(packed_miss, miss_thw)
+            if self._external_vision_encoder is not None:
+                encoded_miss = self._external_vision_encoder(packed_miss, miss_thw)
+            else:
+                encoded_miss = self.encode_vision(packed_miss, miss_thw)
             tok_offset = 0
             merge_sq = self.config.vision_config.spatial_merge_size ** 2
             for idx, (t_g, h_g, w_g) in zip(miss_indices, miss_grids):
@@ -210,7 +233,6 @@ class Model(Cosmos3EdgeModel):
                     self._vision_feature_cache.popitem(last=False)
                 per_frame_features[idx] = feat
             del packed_miss, encoded_miss
-            mx.clear_cache()
 
         out = mx.concatenate([f for f in per_frame_features if f is not None], axis=0)
         mx.eval(out)
@@ -283,18 +305,125 @@ class Model(Cosmos3EdgeModel):
         prefill_step_size: int = 512,
         reserve_extra_tokens: int = 0,
         include_last: bool = False,
+        fastv_layer: Optional[int] = None,
+        fastv_keep_ratio: float = 1.0,
+        fastv_schedule: Optional[Sequence[Tuple[int, float]]] = None,
     ) -> None:
-        """Prefill prompt tokens through the decoder trunk (skipping unused `lm_head`)."""
+        """Prefill prompt tokens through the decoder trunk (skipping unused `lm_head`).
+
+        Supports single-stage FastV (``fastv_layer``, ``fastv_keep_ratio``) or multi-stage
+        Pyramid FastV (``fastv_schedule=[(2, 0.35), (10, 0.12)]``), using exact M-RoPE
+        attention salience from the tail navigation/task queries while preserving 100% of
+        non-vision (text/ego/nav) tokens across all layers.
+        """
         prompt_length = input_ids.shape[1]
         prefill_len = prompt_length if include_last else (prompt_length - 1)
         if prefill_len <= 0:
             return
 
+        has_padding = int((prompt_mask[:, :prefill_len] == 0).sum().item()) > 0
+        n_layers = len(self.language_model.model.layers)
+
+        # Normalize FastV schedule into sorted list of (layer_idx, keep_ratio_of_orig_vis)
+        schedule: List[Tuple[int, float]] = []
+        if fastv_schedule:
+            schedule = sorted(
+                (int(l), float(r))
+                for l, r in fastv_schedule
+                if 0 < int(l) < n_layers and 0.0 < float(r) < 1.0
+            )
+        elif (
+            fastv_layer is not None
+            and 0 < int(fastv_layer) < n_layers
+            and 0.0 < float(fastv_keep_ratio) < 1.0
+        ):
+            schedule = [(int(fastv_layer), float(fastv_keep_ratio))]
+
+        if schedule and input_ids.shape[0] == 1 and not has_padding:
+            vis_mask_np = np.array(
+                (input_ids[0, :prefill_len] == self.config.image_token_index)
+                | (input_ids[0, :prefill_len] == self.config.video_token_index)
+            )
+            orig_n_vis = int(vis_mask_np.sum())
+            if orig_n_vis > 32:
+                from ..base import create_attention_mask
+                from ..cosmos3_edge.language import apply_multimodal_rotary_pos_emb
+
+                # Pre-reserve per-layer KV cache capacities matching the pyramid schedule
+                n_non_vis = prefill_len - orig_n_vis
+                for li, c in enumerate(cache):
+                    if hasattr(c, "prefix_cache_reserve"):
+                        active_ratio = 1.0
+                        for sl, sr in schedule:
+                            if li >= sl:
+                                active_ratio = sr
+                        est_vis = orig_n_vis if active_ratio >= 1.0 else max(32, int(round(orig_n_vis * active_ratio)))
+                        c.prefix_cache_reserve(n_non_vis + est_vis + 1 + reserve_extra_tokens)
+
+                text_m = self.language_model.model
+                h = full_embeds[:, :prefill_len, :]
+                pos = full_pos_ids[:, :, :prefill_len]
+                is_vis_cur = vis_mask_np.copy()
+                sched_map = {sl: sr for sl, sr in schedule}
+
+                cos, sin = text_m.rotary_emb(h, pos)
+                mask_cur = create_attention_mask(h, cache[0])
+
+                for li in range(n_layers):
+                    if li in sched_map:
+                        cur_vis_np = np.where(is_vis_cur)[0]
+                        cur_non_np = np.where(~is_vis_cur)[0]
+                        target_vis = max(32, int(round(orig_n_vis * sched_map[li])))
+                        if target_vis < cur_vis_np.size:
+                            vis_idx = mx.array(cur_vis_np, dtype=mx.int32)
+                            non_idx = mx.array(cur_non_np, dtype=mx.int32)
+                            attn_k = text_m.layers[li].self_attn
+                            x_norm = text_m.layers[li].input_layernorm(h)
+                            cur_seq = int(h.shape[1])
+                            # Cover nav instruction + driving task tokens at tail
+                            n_tail = min(48, cur_seq)
+                            q_tail = (
+                                attn_k.q_proj(x_norm[:, -n_tail:, :])
+                                .reshape(1, n_tail, attn_k.n_heads, attn_k.head_dim)
+                                .transpose(0, 2, 1, 3)
+                            )
+                            k_vis = (
+                                attn_k.k_proj(mx.take(x_norm, vis_idx, axis=1))
+                                .reshape(1, int(cur_vis_np.size), attn_k.n_kv_heads, attn_k.head_dim)
+                                .transpose(0, 2, 1, 3)
+                            )
+                            # Apply exact M-RoPE to Q_tail and K_vis before scoring!
+                            q_tail, _ = apply_multimodal_rotary_pos_emb(
+                                q_tail, q_tail[:, :1], cos[:, -n_tail:, :], sin[:, -n_tail:, :]
+                            )
+                            _, k_vis = apply_multimodal_rotary_pos_emb(
+                                k_vis[:, :1], k_vis, mx.take(cos, vis_idx, axis=1), mx.take(sin, vis_idx, axis=1)
+                            )
+                            if attn_k.n_heads != attn_k.n_kv_heads:
+                                k_vis = mx.repeat(k_vis, attn_k.n_heads // attn_k.n_kv_heads, axis=1)
+                            scores = mx.softmax(
+                                (q_tail @ k_vis.transpose(0, 1, 3, 2)) * attn_k.scale, axis=-1
+                            ).mean(axis=(0, 1, 2))
+                            top_local = mx.sort(mx.argsort(scores)[-target_vis:])
+                            kept_vis = mx.take(vis_idx, top_local)
+                            keep_idx = mx.sort(mx.concatenate([non_idx, kept_vis]))
+
+                            h = mx.take(h, keep_idx, axis=1)
+                            pos = mx.take(pos, keep_idx, axis=2)
+                            # Avoid forcing a GPU->CPU sync on the final (or only) pruning stage!
+                            if li < schedule[-1][0]:
+                                is_vis_cur = is_vis_cur[np.array(keep_idx)]
+                            cos, sin = text_m.rotary_emb(h, pos)
+                            mask_cur = create_attention_mask(h, cache[li])
+
+                    h = text_m.layers[li](h, cos, sin, mask=mask_cur, cache=cache[li])
+                mx.eval([c.state for c in cache])
+                return
+
         for c in cache:
             if hasattr(c, "prefix_cache_reserve"):
                 c.prefix_cache_reserve(prompt_length + reserve_extra_tokens)
 
-        has_padding = int((prompt_mask[:, :prefill_len] == 0).sum().item()) > 0
         for start in range(0, prefill_len, prefill_step_size):
             end = min(start + prefill_step_size, prefill_len)
             chunk_mask = (
@@ -532,13 +661,73 @@ class Model(Cosmos3EdgeModel):
         if not prompt_text.endswith(CLOSED_THINKING):
             prompt_text = prompt_text + CLOSED_THINKING
 
-        proc_out = processor(
-            text=prompt_text,
-            images=images,
-            pixel_bounds=pixel_bounds,
-            padding=False,
-            return_mm_token_type_ids=True,
-        )
+        use_cache = bool(use_vision_cache or sample.get("use_vision_cache", False))
+        cache_keys = [
+            (int(c), int(ts), tuple(pb))
+            for c, ts, pb in zip(cam_ids.tolist(), timestamps.tolist(), pixel_bounds)
+        ]
+
+        if use_cache and hasattr(processor, "image_processor") and hasattr(processor, "image_token"):
+            from ..cosmos3_edge.processing_cosmos3_edge import smart_resize_image
+
+            ip = processor.image_processor
+            ps = ip.patch_size
+            factor = ps * ip.merge_size
+            merge_len = ip.merge_size ** 2
+            all_thw: List[List[int]] = []
+            miss_imgs = []
+            miss_bounds = []
+            miss_indices = []
+            for idx, (frame, key, (lo, hi)) in enumerate(zip(images, cache_keys, pixel_bounds)):
+                if key in self._vision_feature_cache:
+                    arr = np.asarray(frame)
+                    h_raw, w_raw = (arr.shape[1], arr.shape[2]) if (arr.ndim == 3 and arr.shape[0] in (1, 3, 4)) else (arr.shape[0], arr.shape[1])
+                    th, tw = smart_resize_image(h_raw, w_raw, factor=factor, min_pixels=lo, max_pixels=hi)
+                    all_thw.append([1, th // ps, tw // ps])
+                else:
+                    miss_indices.append(idx)
+                    miss_imgs.append(frame)
+                    miss_bounds.append((lo, hi))
+                    all_thw.append([0, 0, 0])
+
+            miss_pix = None
+            if miss_imgs:
+                img_out = ip(miss_imgs, pixel_bounds=miss_bounds)
+                miss_pix = img_out["pixel_values"]
+                for m_pos, grid in zip(miss_indices, img_out["image_grid_thw"].tolist()):
+                    all_thw[m_pos] = grid
+
+            thw_np = np.asarray(all_thw, dtype=np.int64)
+            expanded_text = prompt_text
+            img_tok = processor.image_token
+            for grid in all_thw:
+                n_tok = (grid[0] * grid[1] * grid[2]) // merge_len
+                expanded_text = expanded_text.replace(img_tok, "<|img_ph|>" * n_tok, 1)
+            expanded_text = expanded_text.replace("<|img_ph|>", img_tok)
+            text_inputs = processor.tokenizer([expanded_text], padding=False)
+            arr_ids = np.asarray(text_inputs["input_ids"])
+            mm_types = np.zeros_like(arr_ids)
+            mm_types[arr_ids == processor.image_token_id] = 1
+            tok_dict: Dict[str, Any] = {
+                "input_ids": mx.array(arr_ids),
+                "attention_mask": mx.array(np.asarray(text_inputs["attention_mask"])),
+                "mm_token_type_ids": mx.array(mm_types),
+                "image_grid_thw": mx.array(thw_np),
+                "pixel_values": mx.array(miss_pix) if miss_pix is not None else mx.zeros((0, ps * ps * 3), dtype=mx.float32),
+                "image_cache_keys": cache_keys,
+                "image_cache_miss_indices": miss_indices,
+            }
+        else:
+            proc_out = processor(
+                text=prompt_text,
+                images=images,
+                pixel_bounds=pixel_bounds,
+                padding=False,
+                return_mm_token_type_ids=True,
+            )
+            tok_dict = dict(proc_out)
+            if use_cache:
+                tok_dict["image_cache_keys"] = cache_keys
 
         ego_xyz = np.asarray(sample["ego_history_xyz"], dtype=np.float32)
         ego_rot = np.asarray(sample["ego_history_rot"], dtype=np.float32)
@@ -546,13 +735,6 @@ class Model(Cosmos3EdgeModel):
             ego_xyz = ego_xyz[None, ...]
         if ego_rot.ndim == 4:
             ego_rot = ego_rot[None, ...]
-
-        tok_dict = dict(proc_out)
-        if use_vision_cache or sample.get("use_vision_cache", False):
-            tok_dict["image_cache_keys"] = [
-                (int(c), int(ts), tuple(pb))
-                for c, ts, pb in zip(cam_ids.tolist(), timestamps.tolist(), pixel_bounds)
-            ]
 
         return {
             "tokenized_data": tok_dict,
@@ -579,8 +761,9 @@ class Model(Cosmos3EdgeModel):
         diffusion_steps: int,
         diffusion_temperature: float,
         initial_noise: Optional[mx.array],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run CoT decode + 10-step expert diffusion on `cache`, returning `(sampled_action, gen_ids, first_anchor_pos)`."""
+        speculative_cot: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+        """Run CoT decode + expert diffusion on `cache`, returning `(sampled_action, gen_ids, first_anchor_pos, stats)`."""
         cur_batch = last_tokens.shape[0]
         has_padding = int((prompt_mask == 0).sum().item()) > 0
         cur_tokens = last_tokens
@@ -591,70 +774,224 @@ class Model(Cosmos3EdgeModel):
             if self._decode_language_model is not None
             else self.language_model
         )
+        saved_layer_offsets = [c.offset for c in cache]
 
         generated_cols: List[np.ndarray] = []
         anchor_found = np.zeros((cur_batch,), dtype=bool)
         anchor_cached = False
+        spec_passes = 0
+        spec_accepted = 0
 
-        for step_idx in range(max_generation_length + 1):
-            cur_len = cache[0].offset + 1
-            step_mask = (
-                mx.concatenate(
-                    [
-                        prompt_mask,
-                        mx.ones((cur_batch, cur_len - prompt_length), dtype=mx.int32),
-                    ],
-                    axis=1,
-                )
-                if has_padding
-                else None
-            )
+        use_spec = (
+            speculative_cot
+            and temperature <= 0.0
+            and cur_batch == 1
+            and not has_padding
+        )
 
-            if anchor_found.all():
-                # Only cache the final anchor token K/V — skip unused lm_head!
-                attn_mask = decode_lm._build_mask(
-                    cur_tokens.shape[1], step_mask, cache[0] if cache else None
+        if use_spec:
+            gen_list: List[int] = []
+
+            def _propose_draft(prefix: List[int]) -> List[int]:
+                rem = max_generation_length - len(prefix)
+                if rem <= 0 or not self._cot_history:
+                    return []
+                if not prefix:
+                    return self._cot_history[0][:rem]
+                # Suffix n-gram lookup across rolling CoT history (n=3,2,1)
+                for n in (3, 2, 1):
+                    if len(prefix) < n:
+                        continue
+                    tail = prefix[-n:]
+                    for hist in self._cot_history:
+                        for j in range(len(hist) - n):
+                            if hist[j : j + n] == tail:
+                                cand = hist[j + n : j + n + min(16, rem)]
+                                if cand:
+                                    return cand
+                return []
+
+            while not anchor_found.all() and len(gen_list) < max_generation_length:
+                draft = _propose_draft(gen_list)
+                if draft:
+                    pre_offsets = [c.offset for c in cache]
+                    draft_mx = mx.array([draft], dtype=mx.int32)
+                    cur_emb_step = (
+                        cur_embeds
+                        if cur_embeds is not None
+                        else decode_lm.model.embed_tokens(cur_tokens)
+                    )
+                    draft_embeds = decode_lm.model.embed_tokens(draft_mx)
+                    verify_embeds = mx.concatenate([cur_emb_step, draft_embeds], axis=1)
+                    k_ver = 1 + len(draft)
+                    logical_start = prompt_length - 1 + len(gen_list)
+                    ver_pos_1d = (
+                        mx.arange(logical_start, logical_start + k_ver, dtype=mx.int32)[None, :]
+                        + effective_rope_deltas
+                    )
+                    ver_pos = mx.broadcast_to(ver_pos_1d[None, :, :], (3, 1, k_ver))
+                    out = decode_lm(
+                        inputs=None,
+                        inputs_embeds=verify_embeds,
+                        mask=None,
+                        cache=cache,
+                        position_ids=ver_pos,
+                        logits_to_keep=0,
+                    )
+                    preds = np.array(
+                        mx.argmax(out.logits[0].astype(mx.float32) + logit_mask, axis=-1),
+                        dtype=np.int64,
+                    )
+                    spec_passes += 1
+
+                    # Longest lossless greedy match prefix
+                    m = 0
+                    while m < len(draft) and int(preds[m]) == draft[m]:
+                        m += 1
+                    spec_accepted += m
+
+                    # Check if anchor_id was verified inside draft[:m]
+                    if anchor_id in draft[:m]:
+                        a_idx = draft[:m].index(anchor_id)
+                        gen_list.extend(draft[: a_idx + 1])
+                        for c, po in zip(cache, pre_offsets):
+                            target_off = po + a_idx + 2
+                            if c.offset > target_off:
+                                c.trim(c.offset - target_off)
+                        anchor_found[:] = True
+                        anchor_cached = True
+                        break
+
+                    # Accept verified prefix + bonus token preds[m]
+                    b_tok = int(preds[m])
+                    gen_list.extend(draft[:m])
+                    gen_list.append(b_tok)
+                    for c, po in zip(cache, pre_offsets):
+                        target_off = po + m + 1
+                        if c.offset > target_off:
+                            c.trim(c.offset - target_off)
+
+                    cur_tokens = mx.array([[b_tok]], dtype=mx.int32)
+                    cur_embeds = None
+                    logical_now = prompt_length - 1 + len(gen_list)
+                    next_pos_1d = (
+                        mx.full((1, 1), logical_now, dtype=mx.int32)
+                        + effective_rope_deltas
+                    )
+                    cur_pos = mx.broadcast_to(next_pos_1d[None, :, :], (3, 1, 1))
+                    if b_tok == anchor_id:
+                        _ = decode_lm.model(
+                            cur_tokens,
+                            inputs_embeds=None,
+                            mask=None,
+                            cache=cache,
+                            position_ids=cur_pos,
+                            is_causal=True,
+                        )
+                        mx.eval([c.state for c in cache])
+                        anchor_found[:] = True
+                        anchor_cached = True
+                        break
+                else:
+                    # Single fast decode step when no draft match exists
+                    out = decode_lm(
+                        cur_tokens,
+                        inputs_embeds=cur_embeds,
+                        mask=None,
+                        cache=cache,
+                        position_ids=cur_pos,
+                        logits_to_keep=1,
+                    )
+                    spec_passes += 1
+                    next_logits = out.logits[:, -1, :].astype(mx.float32) + logit_mask
+                    next_tok = mx.argmax(next_logits, axis=-1)
+                    mx.eval(next_tok)
+                    tid = int(next_tok.item())
+                    gen_list.append(tid)
+                    cur_tokens = next_tok[:, None]
+                    cur_embeds = None
+                    logical_now = prompt_length - 1 + len(gen_list)
+                    next_pos_1d = (
+                        mx.full((1, 1), logical_now, dtype=mx.int32)
+                        + effective_rope_deltas
+                    )
+                    cur_pos = mx.broadcast_to(next_pos_1d[None, :, :], (3, 1, 1))
+                    if tid == anchor_id:
+                        _ = decode_lm.model(
+                            cur_tokens,
+                            inputs_embeds=None,
+                            mask=None,
+                            cache=cache,
+                            position_ids=cur_pos,
+                            is_causal=True,
+                        )
+                        mx.eval([c.state for c in cache])
+                        anchor_found[:] = True
+                        anchor_cached = True
+                        break
+
+            generated_cols = [np.array([t], dtype=np.int64) for t in gen_list]
+        else:
+            for step_idx in range(max_generation_length + 1):
+                cur_len = cache[0].offset + 1
+                step_mask = (
+                    mx.concatenate(
+                        [
+                            prompt_mask,
+                            mx.ones((cur_batch, cur_len - prompt_length), dtype=mx.int32),
+                        ],
+                        axis=1,
+                    )
+                    if has_padding
+                    else None
                 )
-                _ = decode_lm.model(
+
+                if anchor_found.all():
+                    # Only cache the final anchor token K/V — skip unused lm_head!
+                    attn_mask = decode_lm._build_mask(
+                        cur_tokens.shape[1], step_mask, cache[0] if cache else None
+                    )
+                    _ = decode_lm.model(
+                        cur_tokens,
+                        inputs_embeds=cur_embeds,
+                        mask=attn_mask,
+                        cache=cache,
+                        position_ids=cur_pos,
+                        is_causal=True,
+                    )
+                    anchor_cached = True
+                    mx.eval([c.state for c in cache])
+                    break
+
+                out = decode_lm(
                     cur_tokens,
                     inputs_embeds=cur_embeds,
-                    mask=attn_mask,
+                    mask=step_mask,
                     cache=cache,
                     position_ids=cur_pos,
-                    is_causal=True,
+                    logits_to_keep=1,
                 )
-                anchor_cached = True
-                mx.eval([c.state for c in cache])
-                break
+                spec_passes += 1
 
-            out = decode_lm(
-                cur_tokens,
-                inputs_embeds=cur_embeds,
-                mask=step_mask,
-                cache=cache,
-                position_ids=cur_pos,
-                logits_to_keep=1,
-            )
+                if step_idx >= max_generation_length:
+                    break
 
-            if step_idx >= max_generation_length:
-                break
+                next_logits = out.logits[:, -1, :].astype(mx.float32) + logit_mask
+                next_tok = _sample_next_tokens(
+                    next_logits, temperature=temperature, top_p=top_p, top_k=top_k
+                )
+                mx.eval(next_tok)
+                next_tok_np = np.array(next_tok, dtype=np.int64)
+                generated_cols.append(next_tok_np)
+                anchor_found = anchor_found | (next_tok_np == anchor_id)
 
-            next_logits = out.logits[:, -1, :].astype(mx.float32) + logit_mask
-            next_tok = _sample_next_tokens(
-                next_logits, temperature=temperature, top_p=top_p, top_k=top_k
-            )
-            mx.eval(next_tok)
-            next_tok_np = np.array(next_tok, dtype=np.int64)
-            generated_cols.append(next_tok_np)
-            anchor_found = anchor_found | (next_tok_np == anchor_id)
-
-            cur_tokens = next_tok[:, None]
-            cur_embeds = None
-            next_pos_1d = (
-                mx.full((cur_batch, 1), cache[0].offset, dtype=mx.int32)
-                + effective_rope_deltas
-            )
-            cur_pos = mx.broadcast_to(next_pos_1d[None, :, :], (3, cur_batch, 1))
+                cur_tokens = next_tok[:, None]
+                cur_embeds = None
+                next_pos_1d = (
+                    mx.full((cur_batch, 1), cache[0].offset, dtype=mx.int32)
+                    + effective_rope_deltas
+                )
+                cur_pos = mx.broadcast_to(next_pos_1d[None, :, :], (3, cur_batch, 1))
 
         if not generated_cols or not anchor_found.all():
             missing = np.where(~anchor_found)[0].tolist()
@@ -667,6 +1004,14 @@ class Model(Cosmos3EdgeModel):
         first_anchor_pos = (gen_np == anchor_id).argmax(axis=1)
         offsets_np = first_anchor_pos + 1 + prompt_length
         prefix_length = int(offsets_np.max())
+
+        # Record clean CoT+anchor sequence in rolling history for Temporal-DFlash
+        if cur_batch == 1:
+            clean_seq = gen_np[0, : int(first_anchor_pos[0]) + 1].tolist()
+            if clean_seq:
+                self._cot_history = [clean_seq] + [
+                    h for h in self._cot_history if h != clean_seq
+                ][: self._cot_history_max_items - 1]
 
         if not anchor_cached and cache[0].offset < prefix_length:
             cur_out_mask = (
@@ -682,18 +1027,24 @@ class Model(Cosmos3EdgeModel):
                 if has_padding
                 else None
             )
-            _ = decode_lm(
+            _ = decode_lm.model(
                 cur_tokens,
-                mask=cur_out_mask,
+                mask=decode_lm._build_mask(
+                    cur_tokens.shape[1], cur_out_mask, cache[0] if cache else None
+                ),
                 cache=cache,
                 position_ids=cur_pos,
-                logits_to_keep=1,
+                is_causal=True,
             )
             mx.eval([c.state for c in cache])
 
-        for c in cache:
-            if c.offset > prefix_length:
-                c.trim(c.offset - prefix_length)
+        added_tokens = prefix_length - (prompt_length - 1)
+        layer_prefix_lengths = []
+        for c, saved_off in zip(cache, saved_layer_offsets):
+            target_off = saved_off + added_tokens
+            if c.offset > target_off:
+                c.trim(c.offset - target_off)
+            layer_prefix_lengths.append(c.offset)
 
         n_diff = self.expert.action_dims[0]
         offsets_mx = mx.array(offsets_np[:, None], dtype=mx.int32)
@@ -728,7 +1079,7 @@ class Model(Cosmos3EdgeModel):
 
         sampled_action_mx = self.expert.sample_actions(
             cache=cache,
-            prefix_length=prefix_length,
+            prefix_length=layer_prefix_lengths,
             position_ids=expert_pos_ids,
             attention_mask=expert_attn_mask,
             batch_size=cur_batch,
@@ -737,7 +1088,12 @@ class Model(Cosmos3EdgeModel):
             initial_noise=initial_noise,
             seed=None,
         )
-        return np.array(sampled_action_mx, dtype=np.float32), gen_np, first_anchor_pos
+        spec_stats = {
+            "total_tokens": int(first_anchor_pos[0]) + 1 if cur_batch == 1 else int(gen_np.shape[1]),
+            "forward_passes": spec_passes,
+            "accepted_draft_tokens": spec_accepted,
+        }
+        return np.array(sampled_action_mx, dtype=np.float32), gen_np, first_anchor_pos, spec_stats
 
     def sample_trajectories(
         self,
@@ -756,6 +1112,10 @@ class Model(Cosmos3EdgeModel):
         prefill_step_size: int = 512,
         low_memory: bool = True,
         reasoning_mode: str = "adaptive",
+        fastv_layer: Optional[int] = None,
+        fastv_keep_ratio: float = 1.0,
+        fastv_schedule: Optional[Sequence[Tuple[int, float]]] = None,
+        speculative_cot: bool = False,
         return_extra: bool = True,
     ) -> tuple:
         """Run VLM chunked prefill -> CoT generation -> Euler flow matching -> trajectory decode.
@@ -766,6 +1126,9 @@ class Model(Cosmos3EdgeModel):
                 - ``"nominal"``: Zero-thought fast path — appends `<NOMINAL><|traj_future_start|>`
                   directly onto the prompt so decode takes 0 tokens / 0 ms with deterministic latency.
                 - ``"none"``: Zero-thought fast path — appends `<|traj_future_start|>` directly.
+            fastv_layer: Optional decoder layer index (e.g. ``2``) after which FastV prunes low-salience vision tokens.
+            fastv_keep_ratio: Fraction of vision tokens to retain after ``fastv_layer`` (e.g. ``0.35``).
+            speculative_cot: Enable lossless Temporal-DFlash parallel block verification across consecutive frames.
             low_memory: When True and `batch_size == 1`, multiple candidates reuse one shared KV cache.
         """
         if self.expert is None:
@@ -840,8 +1203,13 @@ class Model(Cosmos3EdgeModel):
         # 1. Micro-batched vision encode (with optional rolling frame cache) + multimodal embedding assembly
         cached_vis = tokenized.get("cached_image_features")
         cache_keys = tokenized.get("image_cache_keys")
-        if cached_vis is None and cache_keys is not None and pixel_values is not None and image_grid_thw is not None:
-            cached_vis = self._encode_vision_with_cache(pixel_values, image_grid_thw, cache_keys)
+        if cached_vis is None and cache_keys is not None and image_grid_thw is not None:
+            cached_vis = self._encode_vision_with_cache(
+                pixel_values,
+                image_grid_thw,
+                cache_keys,
+                miss_only_packed=tokenized.get("image_cache_miss_indices"),
+            )
 
         emb_features = self.get_input_embeddings(
             input_ids,
@@ -866,6 +1234,9 @@ class Model(Cosmos3EdgeModel):
                 prefill_step_size=prefill_step_size,
                 reserve_extra_tokens=n_diff + 4,
                 include_last=True,
+                fastv_layer=fastv_layer,
+                fastv_keep_ratio=fastv_keep_ratio,
+                fastv_schedule=fastv_schedule,
             )
             del full_embeds
             mx.clear_cache()
@@ -873,14 +1244,15 @@ class Model(Cosmos3EdgeModel):
             has_padding = int((prompt_mask == 0).sum().item()) > 0
             pad_counts_base = mx.sum((prompt_mask == 0).astype(mx.int32), axis=-1, keepdims=True)
             effective_rope_base = rope_deltas - pad_counts_base
-            prefix_length = cache[0].offset
+            logical_prefix_length = cache[0].offset
+            layer_prefix_lengths = [c.offset for c in cache]
 
-            diff_pos = mx.arange(n_diff, dtype=mx.int32)[None, :] + effective_rope_base + prefix_length
+            diff_pos = mx.arange(n_diff, dtype=mx.int32)[None, :] + effective_rope_base + logical_prefix_length
             expert_pos_ids = mx.broadcast_to(diff_pos[None, :, :], (3, batch_size, n_diff))
             if not has_padding:
                 expert_attn_mask = None
             else:
-                attn_mask_np = np.zeros((batch_size, 1, n_diff, prefix_length + n_diff), dtype=np.float32)
+                attn_mask_np = np.zeros((batch_size, 1, n_diff, logical_prefix_length + n_diff), dtype=np.float32)
                 pm_np = np.array(prompt_mask)
                 attn_mask_np[..., :prompt_length] = np.where(pm_np[:, None, None, :] == 0, -1e9, 0.0)
                 expert_attn_mask = mx.array(attn_mask_np)
@@ -890,7 +1262,7 @@ class Model(Cosmos3EdgeModel):
                 noise_s = initial_noise[s_idx : s_idx + 1] if initial_noise is not None else None
                 act_mx = self.expert.sample_actions(
                     cache=cache,
-                    prefix_length=prefix_length,
+                    prefix_length=layer_prefix_lengths,
                     position_ids=expert_pos_ids,
                     attention_mask=expert_attn_mask,
                     batch_size=batch_size,
@@ -948,6 +1320,9 @@ class Model(Cosmos3EdgeModel):
             cache,
             prefill_step_size=prefill_step_size,
             reserve_extra_tokens=reserve_extra,
+            fastv_layer=fastv_layer,
+            fastv_keep_ratio=fastv_keep_ratio,
+            fastv_schedule=fastv_schedule,
         )
         del full_embeds
         mx.clear_cache()
@@ -970,21 +1345,22 @@ class Model(Cosmos3EdgeModel):
         effective_rope_base = rope_deltas - pad_counts_base
 
         # 3. Run candidate(s): in-place cache reuse on multi-sample saves gigabytes of Metal RAM
+        spec_stats: Dict[str, Any] = {}
         if use_inplace_reuse:
-            prefill_saved_offset = prompt_length - 1
+            prefill_saved_offsets = [c.offset for c in cache]
             actions_list = []
             gens_list = []
             anchors_list = []
             for s_idx in range(n_samples_total):
-                for c in cache:
-                    if c.offset > prefill_saved_offset:
-                        c.trim(c.offset - prefill_saved_offset)
+                for c, po in zip(cache, prefill_saved_offsets):
+                    if c.offset > po:
+                        c.trim(c.offset - po)
                 noise_s = (
                     initial_noise[s_idx : s_idx + 1]
                     if initial_noise is not None
                     else None
                 )
-                act_s, gen_s, anc_s = self._decode_and_diffuse_on_cache(
+                act_s, gen_s, anc_s, spec_stats = self._decode_and_diffuse_on_cache(
                     cache=cache,
                     last_tokens=last_tokens_base,
                     last_embeds=last_embeds_base,
@@ -1001,6 +1377,7 @@ class Model(Cosmos3EdgeModel):
                     diffusion_steps=diffusion_steps,
                     diffusion_temperature=diffusion_temperature,
                     initial_noise=noise_s,
+                    speculative_cot=speculative_cot,
                 )
                 actions_list.append(act_s)
                 gens_list.append(gen_s[0])
@@ -1016,7 +1393,7 @@ class Model(Cosmos3EdgeModel):
             first_anchor_pos = np.array(anchors_list, dtype=np.int64)
         else:
             cache = _repeat_kv_cache(cache, n_samples_total)
-            sampled_action_np, gen_np, first_anchor_pos = self._decode_and_diffuse_on_cache(
+            sampled_action_np, gen_np, first_anchor_pos, spec_stats = self._decode_and_diffuse_on_cache(
                 cache=cache,
                 last_tokens=mx.repeat(last_tokens_base, n_samples_total, axis=0),
                 last_embeds=mx.repeat(last_embeds_base, n_samples_total, axis=0),
@@ -1033,6 +1410,7 @@ class Model(Cosmos3EdgeModel):
                 diffusion_steps=diffusion_steps,
                 diffusion_temperature=diffusion_temperature,
                 initial_noise=initial_noise,
+                speculative_cot=speculative_cot,
             )
 
         del cache
@@ -1064,7 +1442,8 @@ class Model(Cosmos3EdgeModel):
         extra: Dict[str, Any] = {
             "sampled_action": sampled_action_np.reshape(
                 *group_shape, *self.expert.action_dims
-            )
+            ),
+            "spec_stats": spec_stats,
         }
         if tokenizer is not None:
             decoded = _decode_cot_texts(tokenizer, full_seqs)
