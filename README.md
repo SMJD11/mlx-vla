@@ -1,4 +1,62 @@
-<h1 align="center">MLX-VLM</h1>
+<h1 align="center">MLX-VLA (built on MLX-VLM)</h1>
+
+<p align="center">
+  <strong>Vision-Language-Action (VLA) &amp; Multimodal Models on Apple Silicon with MLX.</strong><br>
+  First-class pure-MLX support for <strong>NVIDIA Alpamayo 2 Edge (2B)</strong>, <strong>NVIDIA Cosmos 3 Edge</strong>, and <strong>Alpamayo 1.5 (10B)</strong> — zero PyTorch required at runtime.
+</p>
+
+<p align="center">
+  <a href="mlx_vlm/models/alpamayo2_edge/README.md"><strong>Alpamayo 2 Edge / VLA Docs</strong></a> &middot;
+  <a href="#alpamayo-mlx-checkpoints-hugging-face"><strong>Pre-Converted Models</strong></a> &middot;
+  <a href="#installation"><strong>Installation</strong></a> &middot;
+  <a href="https://github.com/Neywa-Labs/mlx-vlm">Upstream MLX-VLM</a>
+</p>
+
+---
+
+## Alpamayo MLX Checkpoints (Hugging Face)
+
+### Alpamayo 2 Edge (2B) — Native `mlx_vlm.load(...)` Support
+
+| Model | Precision | Size | Active RAM | Notes |
+|---|---|---:|---:|---|
+| **[`Safman/Alpamayo2-Edge-MLX-bf16`](https://huggingface.co/Safman/Alpamayo2-Edge-MLX-bf16)** | Full `BF16` | `5.30 GB` | `5.30 GB` | Full-precision reference (`ADE@3s = 0.507 m` on 5-clip HD nav suite) |
+| **[`Safman/Alpamayo2-Edge-MLX-q8`](https://huggingface.co/Safman/Alpamayo2-Edge-MLX-q8)** | `Q8` LLM + Expert, `BF16` Vision/Action | `3.28 GB` | `3.28 GB` | Virtually lossless vs `BF16` (`1.35 s` load on M3 Pro) |
+| **[`Safman/Alpamayo2-Edge-MLX-q6`](https://huggingface.co/Safman/Alpamayo2-Edge-MLX-q6)** | `Q6` LLM + Expert, `BF16` Vision/Action | `2.74 GB` | `2.74 GB` | Balanced footprint and accuracy (`1.32 s` load) |
+| **[`Safman/Alpamayo2-Edge-MLX-q4`](https://huggingface.co/Safman/Alpamayo2-Edge-MLX-q4)** | `Q4` LLM + Expert, `BF16` Vision/Action | `2.20 GB` | `2.20 GB` | Smallest &amp; fastest (`1.73–2.5 Hz` w/ CoreML ANE async pipeline) |
+
+### Alpamayo 1.5 (10B) — Apple Silicon Mac Port
+
+| Model | Contents | Size | Status / Notes |
+|---|---|---:|---|
+| **[`Safman/Alpamayo-1.5-Mac-MLX-4bit`](https://huggingface.co/Safman/Alpamayo-1.5-Mac-MLX-4bit)** | `vlm/` (4-bit `Cosmos-Reason2-8B` w/ all 4,054 driving tokens) + `expert/` (36L Diffusion Action Expert) | `10.36 GB` | Complete standalone 10B Mac bundle (verified 1,258 MLX tensors + index) |
+| **[`Safman/Alpamayo-1.5-Mac-DFlash`](https://huggingface.co/Safman/Alpamayo-1.5-Mac-DFlash)** | 2-layer DFlash speculative draft head | `0.94 GB` | Speculative CoT decoding accelerator for Alpamayo 1.5 (10B) |
+| [`Safman/Alpamayo-1.5-Mac-MLX-8bit`](https://huggingface.co/Safman/Alpamayo-1.5-Mac-MLX-8bit) | Action Expert weights only (`int8` + `fp16`) | `9.13 GB` | Expert-only — pair with `vlm/` from `Alpamayo-1.5-Mac-MLX-4bit` |
+| [`Safman/Alpamayo-1.5-Mac-MLX-16bit`](https://huggingface.co/Safman/Alpamayo-1.5-Mac-MLX-16bit) | Action Expert weights only (`fp16`) | `9.12 GB` | Expert-only — pair with `vlm/` from `Alpamayo-1.5-Mac-MLX-4bit` |
+
+### VLA Quick Start
+
+```bash
+pip install "git+https://github.com/SMJD11/mlx-vla.git"
+```
+
+```python
+from mlx_vlm import load
+
+# Load any Alpamayo 2 Edge MLX quant directly (zero PyTorch required)
+model, processor = load("Safman/Alpamayo2-Edge-MLX-q4")
+inputs = model.prepare_driving_inputs(sample, processor, nav_text="Turn right in 30m")
+pred_xyz, pred_rot, _, extra = model.sample_trajectories(
+    inputs, tokenizer=processor.tokenizer, reasoning_mode="adaptive", diffusion_steps=10
+)
+print("CoT:", extra["cot"][0, 0, 0])
+```
+
+Full architecture details, real-time CoreML ANE + Temporal-DFlash + FastV acceleration stack, and M3 Pro benchmarks: **[`mlx_vlm/models/alpamayo2_edge/README.md`](mlx_vlm/models/alpamayo2_edge/README.md)**.
+
+---
+
+<h2 align="center">Upstream MLX-VLM Documentation</h2>
 
 [![Any input. Any output. All local. Runs locally on your Mac. Install with pip install -U mlx-vlm or try it in Nativ.](https://raw.githubusercontent.com/Neywa-Labs/mlx-vlm/b7fda105064b609fcc2ef243bd628c3dad317564/docs/assets/mlx-vlm-banner.png)](https://runnativ.ai)
 
@@ -61,6 +119,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| **Alpamayo 2 Edge / Cosmos 3 Edge (VLA)** | [Docs](mlx_vlm/models/alpamayo2_edge/README.md) |
 | Inkling 2 Small | [Docs](mlx_vlm/models/inkling2/README.md) |
 | LFM3 / LFM3-VL | [Docs](mlx_vlm/models/lfm3/README.md) |
 | SenseNova-Loop-9B | [Docs](mlx_vlm/models/sensenova_loop/README.md) |
